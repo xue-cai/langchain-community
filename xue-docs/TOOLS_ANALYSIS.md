@@ -227,8 +227,9 @@ class TavilySearchResults(BaseTool):
 
 ## Authentication Patterns
 
-Tools use **four distinct authentication strategies**, depending on the external
-service they integrate with.
+Tools use **five distinct authentication strategies**, depending on the external
+service they integrate with. After presenting the examples, we explain the
+rationale behind these choices and their security trade-offs.
 
 ### 1. API Key via Environment Variable (most common)
 
@@ -318,10 +319,176 @@ class GmailBaseTool(BaseTool):
     api_resource: Resource = Field(default_factory=build_resource_service)
 ```
 
-### 4. No Authentication (public APIs / local operations)
+Office 365 tools follow a similar OAuth pattern with Microsoft Graph:
+
+```python
+# libs/community/langchain_community/tools/office365/utils.py
+
+def authenticate() -> Account:
+    client_id = os.environ["CLIENT_ID"]
+    client_secret = os.environ["CLIENT_SECRET"]
+    credentials = (client_id, client_secret)
+    account = Account(credentials)
+    if not account.is_authenticated:
+        account.authenticate(
+            scopes=[
+                "https://graph.microsoft.com/Mail.ReadWrite",
+                "https://graph.microsoft.com/Mail.Send",
+                "https://graph.microsoft.com/Calendars.ReadWrite",
+                ...
+            ]
+        )
+    return account
+```
+
+### 4. Cloud-Native Identity (AWS IAM / Azure Managed Identity / GCP Workload Identity)
+
+AWS, Azure, and GCP integrations do *not* use static API keys. Instead they
+rely on the cloud provider's identity stack — IAM roles, managed identities,
+or credential chains that automatically resolve to short-lived tokens.
+
+**AWS — boto3 credential chain:**
+
+```python
+# libs/community/langchain_community/utilities/awslambda.py
+
+class LambdaWrapper(BaseModel):
+    function_name: Optional[str] = None
+    awslambda_tool_name: Optional[str] = None
+    awslambda_tool_description: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_environment(cls, values: Dict) -> Any:
+        # boto3 resolves credentials automatically:
+        #   1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+        #   2. Shared credentials file (~/.aws/credentials)
+        #   3. IAM role (if on EC2/ECS/Lambda)
+        #   4. Instance Metadata Service (IMDS)
+        values["lambda_client"] = boto3.client("lambda")
+        return values
+```
+
+**Azure — DefaultAzureCredential:**
+
+```python
+# libs/community/langchain_community/vectorstores/azuresearch.py (simplified)
+
+from azure.identity import DefaultAzureCredential
+
+def _get_search_client(endpoint, index_name, key=None, azure_credential=None, ...):
+    if key is not None:
+        credential = AzureKeyCredential(key)          # fallback: static key
+    else:
+        credential = azure_credential or DefaultAzureCredential()
+        # DefaultAzureCredential tries, in order:
+        #   1. Environment variables (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET)
+        #   2. Managed Identity (if on Azure VM / App Service / Functions)
+        #   3. Azure CLI cached token
+        #   4. Interactive browser login
+    return SearchClient(endpoint, index_name, credential=credential)
+```
+
+### 5. No Authentication (public APIs / local operations)
 
 Tools like Wikipedia, Arxiv, Shell, and File Management do not require any
 authentication — they access public APIs or local system resources directly.
+
+---
+
+### Why API Key for Some Tools and OAuth for Others?
+
+The choice is driven by **whose data the tool accesses** — the *developer's*
+service or the *end-user's* personal account.
+
+| Dimension | API Key | OAuth 2.0 |
+|-----------|---------|-----------|
+| **Who owns the data?** | The developer / organization that registered the key | The end-user who grants consent |
+| **Typical scope** | Service-wide: "search the web", "run code", "call an LLM" | User-specific: "read *my* emails", "manage *my* calendar" |
+| **Credential lifetime** | Long-lived (often never expires unless rotated) | Short-lived access token + refresh token |
+| **User interaction** | None — key is set once in an env var | Requires a browser-based consent screen (at least once) |
+| **Revocation** | Regenerate the key on the provider dashboard | User can revoke access at any time from their account settings |
+
+**Rule of thumb:** If the tool touches data that belongs to a *specific user*
+(Gmail, Google Calendar, Outlook, Google Drive), **OAuth should always be
+used** because:
+
+1. The user must *consent* to the specific permissions (scopes) being granted.
+2. The application never sees the user's password.
+3. Access can be scoped narrowly (e.g., `Mail.ReadWrite` but *not*
+   `Contacts.Read`).
+4. The user can revoke access independently.
+
+An API key cannot satisfy any of these requirements — it represents the
+*application*, not the *user*.
+
+### Is an API Key Less Secure Than OAuth?
+
+Yes, in most meaningful ways:
+
+| Risk | API Key | OAuth 2.0 |
+|------|---------|-----------|
+| **Credential exposure** | A single leaked key grants full access until manually rotated | A leaked access token expires in minutes/hours; refresh tokens require client credentials to use, though they still need secure storage |
+| **Scope limitation** | Typically all-or-nothing — the key can do everything the plan allows | Scopes limit what operations the token can perform |
+| **Auditability** | Hard to trace which user performed an action | Each token is tied to a specific user identity |
+| **Rotation** | Manual — must be done by the developer | Automatic — refresh tokens cycle access tokens continuously |
+| **Revocability** | Only by regenerating on the provider dashboard | User or admin can revoke at any time |
+
+That said, API keys are *appropriate* for service-to-service calls where there
+is no end-user context (e.g., searching Bing, calling Tavily, running code in
+E2B). The security tradeoff is acceptable because:
+
+- The key represents the *application*, and the application is trusted.
+- There is no per-user data to protect.
+- The operational simplicity of a single key outweighs the risk.
+
+### Better Alternatives: Cloud-Native Identity
+
+For production deployments, **both** API keys and OAuth can be replaced (or
+supplemented) by cloud-native identity mechanisms that eliminate static
+credentials entirely.
+
+| Mechanism | How it works | Codebase example |
+|-----------|-------------|------------------|
+| **AWS IAM Roles** | An EC2 instance, Lambda function, or ECS task is assigned an IAM role. The SDK (`boto3`) automatically retrieves short-lived credentials from the Instance Metadata Service (IMDS). No keys to manage or rotate. | `LambdaWrapper` in `utilities/awslambda.py` — calls `boto3.client("lambda")` which resolves credentials from the IAM role attached to the compute environment. |
+| **Azure Managed Identity** | An Azure VM, App Service, or Function is assigned a system- or user-assigned managed identity. `DefaultAzureCredential` from the `azure-identity` SDK automatically picks it up. | `AzureSearch` in `vectorstores/azuresearch.py` — falls back to `DefaultAzureCredential()` when no API key is provided, which resolves to managed identity on Azure compute. |
+| **GCP Workload Identity** | A GKE pod or Cloud Run service is bound to a Google Cloud service account via workload identity federation. The Google SDKs resolve credentials automatically. | Not directly used in this codebase, but `google-auth` (used by Gmail tools) supports Application Default Credentials (ADC) which resolves the same way. |
+
+**Why these are more secure than API keys:**
+
+1. **No static secrets** — credentials are short-lived tokens rotated
+   automatically by the cloud provider.
+2. **No secret storage** — there are no keys in environment variables, config
+   files, or secret managers to leak.
+3. **Least privilege** — IAM policies and managed identity role assignments
+   can be scoped to exactly the permissions needed.
+4. **Audit trail** — every API call is tied to a specific identity in cloud
+   audit logs (AWS CloudTrail, Azure Monitor, GCP Cloud Audit Logs).
+
+### Authentication Decision Table
+
+When integrating a new tool, use this table to choose the right authentication
+pattern:
+
+```
+Is the tool accessing a specific user's personal data?
+├── YES → Use OAuth 2.0 (Gmail, Calendar, Drive, Outlook)
+│         • Define narrow scopes
+│         • Persist refresh tokens securely
+│         • Handle token expiry and re-consent
+│
+└── NO → Is the tool deployed on a cloud provider (AWS/Azure/GCP)?
+         ├── YES → Use cloud-native identity (IAM role, Managed Identity)
+         │         • No static credentials to manage
+         │         • Automatic rotation
+         │         • Scoped via IAM policy
+         │
+         └── NO → Use an API key
+                   • Store in SecretStr (Pydantic) to prevent logging
+                   • Read from environment variable, not hardcode
+                   • Rotate periodically
+                   • Use the provider's key-scoping features if available
+```
 
 ---
 
@@ -1008,10 +1175,23 @@ MCP protocol.
 The repository also contains tools for **executing Python code** in sandboxed
 environments. These are the LangChain equivalent of a "code interpreter" tool.
 
+> **Are E2B and Bearly cloud sandboxes?** Yes — both are **commercial cloud
+> services** that provide isolated sandbox environments for running untrusted
+> code. Your Python code is sent over HTTPS to their servers, executed in a
+> container, and the output is returned. This is a critical safety property:
+> the LLM-generated code never executes on your machine or in your production
+> environment. Both require an API key for authentication (`E2B_API_KEY` and
+> Bearly's Authorization header, respectively).
+>
+> **Privacy note:** Because code and data are sent to a third-party service,
+> review each provider's data handling and logging policies before sending
+> sensitive information. See [E2B security docs](https://e2b.dev/docs) and
+> [Bearly docs](https://docs.bearly.ai) for details.
+
 | Tool | Class | How it works | Status |
 |------|-------|-------------|--------|
-| **E2B Data Analysis** | `E2BDataAnalysisTool` | Runs Python in a cloud sandbox via the [E2B](https://e2b.dev) API. Supports file uploads and artifact downloads. | **Active** |
-| **Bearly Interpreter** | `BearlyInterpreterTool` | Runs Python in a sandbox via the [Bearly](https://bearly.ai) API. Accepts uploaded files and returns stdout/stderr/file links. | **Active** |
+| **E2B Data Analysis** | `E2BDataAnalysisTool` | Sends code to E2B's cloud sandbox (`e2b.dev`). The session is long-running — state persists across calls. Supports file uploads and artifact downloads. | **Active** |
+| **Bearly Interpreter** | `BearlyInterpreterTool` | Sends code to Bearly's cloud sandbox (`exec.bearly.ai`). Each call is stateless. Returns stdout, stderr, exit code, and file links. | **Active** |
 | **Python REPL** | `PythonREPLTool` | Executes code in the local Python process (no sandbox). | **Deprecated** — removed from exports |
 | **Python AST REPL** | `PythonAstREPLTool` | Same as above but parsed via AST first. | **Deprecated** — removed from exports |
 
