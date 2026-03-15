@@ -545,48 +545,109 @@ inheritance.
 
 This section compares how **LangChain tools** and **MCP (Model Context Protocol)
 tools** define their shape, expose it to an LLM, and participate in a
-multi-turn conversation. Both approaches solve the same problem — *telling the
-LLM what tools are available and how to call them* — but they do it in
-fundamentally different ways.
+multi-turn conversation. The examples use two real tools from this repository —
+**Bing Search** (a simple single-input tool) and **Gmail Send Message** (a
+multi-input tool with optional parameters) — to illustrate the patterns.
+
+Both approaches solve the same problem — *telling the LLM what tools are
+available and how to call them* — but they do it in fundamentally different
+ways.
 
 ### 1. Defining a Tool
 
 #### LangChain — Python class with Pydantic schema
 
-The tool shape is defined **statically at code-writing time** as class
-attributes on a `BaseTool` subclass:
+Tool shapes are defined **statically at code-writing time** as class attributes
+on a `BaseTool` subclass.
+
+**Example A — Bing Search** (simple, single input):
 
 ```python
-# langchain_community/tools/tavily_search/tool.py
+# langchain_community/tools/bing_search/tool.py
 
-from pydantic import BaseModel, Field
-from langchain_core.tools import BaseTool
-
-class TavilyInput(BaseModel):
-    """Pydantic model — defines the tool's input parameters."""
-    query: str = Field(description="search query to look up")
-
-class TavilySearchResults(BaseTool):
-    name: str = "tavily_search_results_json"
+class BingSearchResults(BaseTool):
+    name: str = "bing_search_results_json"
     description: str = (
-        "A search engine optimized for comprehensive, accurate, and trusted results. "
+        "A wrapper around Bing Search. "
         "Useful for when you need to answer questions about current events. "
-        "Input should be a search query."
+        "Input should be a search query. Output is an array of the query results."
     )
-    args_schema: Type[BaseModel] = TavilyInput
+    num_results: int = 4
+    api_wrapper: BingSearchAPIWrapper
+    response_format: Literal["content_and_artifact"] = "content_and_artifact"
 
-    def _run(self, query: str, **kwargs) -> str:
-        # Delegates to the API wrapper (HTTP calls, auth, etc.)
-        return self.api_wrapper.raw_results(query, self.max_results)
+    def _run(
+        self,
+        query: str,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> Tuple[str, List[Dict]]:
+        """Use the tool."""
+        try:
+            results = self.api_wrapper.results(query, self.num_results)
+            return str(results), results
+        except Exception as e:
+            return repr(e), []
 ```
 
-The key pieces — `name`, `description`, and `args_schema` — are baked into the
-Python class definition.
+`BingSearchResults` has no explicit `args_schema` — `BaseTool` infers a
+schema with a single `query: str` parameter from the `_run` signature.
+
+**Example B — Gmail Send Message** (multi-input, with optional fields):
+
+```python
+# langchain_community/tools/gmail/send_message.py
+
+class SendMessageSchema(BaseModel):
+    """Input for SendMessageTool."""
+    message: str = Field(..., description="The message to send.")
+    to: Union[str, List[str]] = Field(..., description="The list of recipients.")
+    subject: str = Field(..., description="The subject of the message.")
+    cc: Optional[Union[str, List[str]]] = Field(
+        None, description="The list of CC recipients."
+    )
+    bcc: Optional[Union[str, List[str]]] = Field(
+        None, description="The list of BCC recipients."
+    )
+
+
+class GmailSendMessage(GmailBaseTool):
+    name: str = "send_gmail_message"
+    description: str = (
+        "Use this tool to send email messages. The input is the message, recipients"
+    )
+    args_schema: Type[SendMessageSchema] = SendMessageSchema
+
+    def _run(
+        self,
+        message: str,
+        to: Union[str, List[str]],
+        subject: str,
+        cc: Optional[Union[str, List[str]]] = None,
+        bcc: Optional[Union[str, List[str]]] = None,
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> str:
+        """Run the tool."""
+        try:
+            create_message = self._prepare_message(message, to, subject, cc=cc, bcc=bcc)
+            send_message = (
+                self.api_resource.users()
+                .messages()
+                .send(userId="me", body=create_message)
+            )
+            sent_message = send_message.execute()
+            return f"Message sent. Message Id: {sent_message['id']}"
+        except Exception as error:
+            raise Exception(f"An error occurred: {error}")
+```
+
+`GmailSendMessage` defines an explicit `args_schema` with required *and*
+optional fields — the LLM sees all five parameters and their descriptions.
 
 #### MCP — JSON-RPC `tools/list` response from a remote server
 
-In MCP, the tool shape is defined on a **remote MCP server** and discovered
-at runtime via a `tools/list` JSON-RPC call:
+In MCP, tool shapes are defined on a **remote MCP server** and discovered at
+runtime via a `tools/list` JSON-RPC call. Below is the equivalent of the two
+tools above as an MCP server would describe them:
 
 ```json
 // Client sends:
@@ -599,8 +660,8 @@ at runtime via a `tools/list` JSON-RPC call:
   "result": {
     "tools": [
       {
-        "name": "tavily_search",
-        "description": "A search engine optimized for comprehensive, accurate results.",
+        "name": "bing_search",
+        "description": "Search the web using Bing. Input should be a search query.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -611,40 +672,59 @@ at runtime via a `tools/list` JSON-RPC call:
           },
           "required": ["query"]
         }
+      },
+      {
+        "name": "send_gmail_message",
+        "description": "Send an email message via Gmail.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "message": { "type": "string", "description": "The message to send." },
+            "to":      { "type": "string", "description": "Recipient email address." },
+            "subject": { "type": "string", "description": "The subject of the message." },
+            "cc":      { "type": "string", "description": "CC recipients (optional)." },
+            "bcc":     { "type": "string", "description": "BCC recipients (optional)." }
+          },
+          "required": ["message", "to", "subject"]
+        }
       }
     ]
   }
 }
 ```
 
-The tool name, description, and input schema are returned as **JSON Schema**
-by the server, not defined in the client's code.
+The tool names, descriptions, and input schemas are returned as **JSON Schema**
+by the server — not defined in the client's code.
 
 ### 2. Telling the LLM About the Tools
 
-Both approaches ultimately produce the same thing: a JSON object that the LLM
-API understands. The difference is *where* that JSON comes from.
+Both approaches ultimately produce the same thing: a JSON `tools` array that
+the LLM API understands. The difference is *where* that JSON comes from.
 
 #### LangChain — `bind_tools()` converts Pydantic to JSON at call time
 
 ```python
 from langchain_openai import ChatOpenAI
-from langchain_community.tools import TavilySearchResults
+from langchain_community.tools.bing_search import BingSearchResults
+from langchain_community.tools.gmail import GmailSendMessage
+from langchain_community.utilities import BingSearchAPIWrapper
 
-# 1. Instantiate the tool (shape is in the Python class)
-tool = TavilySearchResults()
+# 1. Instantiate the tools (shapes are in the Python classes)
+search = BingSearchResults(api_wrapper=BingSearchAPIWrapper())
+gmail = GmailSendMessage()
 
 # 2. Bind to LLM — internally converts Pydantic → JSON Schema → OpenAI format
 llm = ChatOpenAI(model="gpt-4o")
-llm_with_tools = llm.bind_tools([tool])
+llm_with_tools = llm.bind_tools([search, gmail])
 ```
 
 Under the hood, `bind_tools` calls
-`langchain_core.utils.function_calling.convert_to_openai_tool()` which:
+`langchain_core.utils.function_calling.convert_to_openai_tool()` for each
+tool, which:
 
 1. Reads `tool.name` and `tool.description`
 2. Calls `tool.tool_call_schema` → gets the Pydantic model
-3. Calls `.model_json_schema()` on the Pydantic model → produces JSON Schema
+3. Calls `.model_json_schema()` → produces JSON Schema
 4. Wraps it in the OpenAI function-calling format
 
 The resulting JSON sent to the LLM API looks like:
@@ -655,17 +735,32 @@ The resulting JSON sent to the LLM API looks like:
     {
       "type": "function",
       "function": {
-        "name": "tavily_search_results_json",
-        "description": "A search engine optimized for comprehensive...",
+        "name": "bing_search_results_json",
+        "description": "A wrapper around Bing Search. Useful for when you need to answer questions about current events...",
         "parameters": {
           "type": "object",
           "properties": {
-            "query": {
-              "type": "string",
-              "description": "search query to look up"
-            }
+            "query": { "type": "string" }
           },
           "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "send_gmail_message",
+        "description": "Use this tool to send email messages...",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": { "type": "string", "description": "The message to send." },
+            "to":      { "type": "string", "description": "The list of recipients." },
+            "subject": { "type": "string", "description": "The subject of the message." },
+            "cc":      { "type": "string", "description": "The list of CC recipients." },
+            "bcc":     { "type": "string", "description": "The list of BCC recipients." }
+          },
+          "required": ["message", "to", "subject"]
         }
       }
     }
@@ -675,7 +770,8 @@ The resulting JSON sent to the LLM API looks like:
 
 #### MCP — Client forwards `tools/list` result to LLM
 
-An MCP client first discovers available tools, then passes them to the LLM:
+An MCP client first discovers available tools, then maps them to the LLM's
+format:
 
 ```python
 # 1. Connect to MCP server and discover tools at runtime
@@ -709,58 +805,86 @@ Python class.
 
 ### 3. Full Conversation Example
 
-The following example shows a user asking "What is the latest news on AI?" and
-the system using a search tool to answer. Both approaches follow the same
+The following example shows a **multi-tool conversation** where the user asks
+the agent to search for a topic and email the results to a colleague. The LLM
+must decide to call *two* tools in sequence. Both approaches follow the same
 conceptual loop:
 
 ```
-User message → LLM decides to call tool → Tool executes → Result returned → LLM answers
+User message → LLM calls bing_search → Result returned
+            → LLM calls send_gmail_message → Confirmation returned
+            → LLM answers user
 ```
 
 #### LangChain Conversation
 
 ```python
 from langchain_openai import ChatOpenAI
-from langchain_community.tools import TavilySearchResults
+from langchain_community.tools.bing_search import BingSearchResults
+from langchain_community.tools.gmail import GmailSendMessage
+from langchain_community.utilities import BingSearchAPIWrapper
 from langchain_core.messages import HumanMessage, ToolMessage
 
 # Setup
-tool = TavilySearchResults()
+search = BingSearchResults(api_wrapper=BingSearchAPIWrapper())
+gmail = GmailSendMessage()
+tools = {t.name: t for t in [search, gmail]}
+
 llm = ChatOpenAI(model="gpt-4o")
-llm_with_tools = llm.bind_tools([tool])
+llm_with_tools = llm.bind_tools([search, gmail])
 
-# Step 1: User asks a question
-messages = [HumanMessage(content="What is the latest news on AI?")]
+# Step 1: User asks a question that requires both tools
+messages = [HumanMessage(
+    content="Search Bing for the latest AI news and email a summary to alice@example.com"
+)]
 
-# Step 2: LLM responds with a tool call (not a text answer)
-ai_message = llm_with_tools.invoke(messages)
-# ai_message.tool_calls == [
-#     {"name": "tavily_search_results_json",
-#      "args": {"query": "latest news on AI"},
+# Step 2: LLM responds with a tool call — bing_search first
+ai_msg = llm_with_tools.invoke(messages)
+# ai_msg.tool_calls == [
+#     {"name": "bing_search_results_json",
+#      "args": {"query": "latest AI news 2026"},
 #      "id": "call_abc123"}
 # ]
 
-# Step 3: Execute the tool
-tool_result = tool.invoke(ai_message.tool_calls[0]["args"])
+# Step 3: Execute the search tool
+tool_call = ai_msg.tool_calls[0]
+result = tools[tool_call["name"]].invoke(tool_call["args"])
 
 # Step 4: Append tool call + result to messages
-messages.append(ai_message)
-messages.append(
-    ToolMessage(content=str(tool_result), tool_call_id="call_abc123")
-)
+messages.append(ai_msg)
+messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
 
-# Step 5: LLM generates final answer using the tool result
-final_response = llm_with_tools.invoke(messages)
-print(final_response.content)
-# "Here are the latest developments in AI: ..."
+# Step 5: LLM now calls the gmail tool with the search results
+ai_msg2 = llm_with_tools.invoke(messages)
+# ai_msg2.tool_calls == [
+#     {"name": "send_gmail_message",
+#      "args": {"to": "alice@example.com",
+#               "subject": "Latest AI News Summary",
+#               "message": "<html>Here are the latest AI developments..."},
+#      "id": "call_def456"}
+# ]
+
+# Step 6: Execute the gmail tool
+tool_call2 = ai_msg2.tool_calls[0]
+result2 = tools[tool_call2["name"]].invoke(tool_call2["args"])
+# "Message sent. Message Id: 18f3a..."
+
+# Step 7: Append and get final answer
+messages.append(ai_msg2)
+messages.append(ToolMessage(content=str(result2), tool_call_id=tool_call2["id"]))
+
+final = llm_with_tools.invoke(messages)
+print(final.content)
+# "Done! I searched Bing for the latest AI news and emailed a summary to alice@example.com."
 ```
 
 **What happened under the hood:**
 
 | Step | HTTP Request to OpenAI |
 |------|----------------------|
-| 2 | `POST /chat/completions` with `tools` parameter (JSON schema from Pydantic) and user message |
-| 5 | `POST /chat/completions` with user message + assistant tool_call + tool result |
+| 2 | `POST /chat/completions` with `tools` (both schemas) + user message → LLM returns `bing_search` call |
+| 5 | `POST /chat/completions` with messages + search result → LLM returns `send_gmail_message` call |
+| 7 | `POST /chat/completions` with all messages + gmail result → LLM returns text answer |
 
 #### MCP Conversation
 
@@ -768,7 +892,7 @@ print(final_response.content)
 import json
 import openai
 
-# Setup — connect to an MCP server
+# Setup — connect to an MCP server that exposes bing_search + gmail tools
 mcp_tools = await mcp_client.request("tools/list")  # runtime discovery
 
 openai_tools = [
@@ -785,45 +909,67 @@ openai_tools = [
 
 client = openai.OpenAI()
 
-# Step 1: User asks a question
-messages = [{"role": "user", "content": "What is the latest news on AI?"}]
+# Step 1: User asks a question that requires both tools
+messages = [{"role": "user",
+             "content": "Search Bing for the latest AI news and email a summary to alice@example.com"}]
 
-# Step 2: LLM responds with a tool call
+# Step 2: LLM responds with bing_search tool call
 response = client.chat.completions.create(
     model="gpt-4o", messages=messages, tools=openai_tools
 )
 tool_call = response.choices[0].message.tool_calls[0]
-# tool_call.function.name == "tavily_search"
-# tool_call.function.arguments == '{"query": "latest news on AI"}'
+# tool_call.function.name == "bing_search"
+# tool_call.function.arguments == '{"query": "latest AI news 2026"}'
 
-# Step 3: Execute the tool via MCP server (JSON-RPC call)
-tool_result = await mcp_client.request(
+# Step 3: Execute via MCP server (JSON-RPC call)
+search_result = await mcp_client.request(
     "tools/call",
-    {"name": tool_call.function.name, "arguments": json.loads(tool_call.function.arguments)},
+    {"name": tool_call.function.name,
+     "arguments": json.loads(tool_call.function.arguments)},
 )
 
-# Step 4: Append tool call + result to messages
+# Step 4: Append and continue
 messages.append(response.choices[0].message)
-messages.append(
-    {"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)}
+messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                 "content": str(search_result)})
+
+# Step 5: LLM now calls send_gmail_message
+response2 = client.chat.completions.create(
+    model="gpt-4o", messages=messages, tools=openai_tools
+)
+tool_call2 = response2.choices[0].message.tool_calls[0]
+# tool_call2.function.name == "send_gmail_message"
+# tool_call2.function.arguments == '{"to": "alice@example.com", "subject": "...", "message": "..."}'
+
+# Step 6: Execute gmail via MCP server
+gmail_result = await mcp_client.request(
+    "tools/call",
+    {"name": tool_call2.function.name,
+     "arguments": json.loads(tool_call2.function.arguments)},
 )
 
-# Step 5: LLM generates final answer
+# Step 7: Append and get final answer
+messages.append(response2.choices[0].message)
+messages.append({"role": "tool", "tool_call_id": tool_call2.id,
+                 "content": str(gmail_result)})
+
 final = client.chat.completions.create(
     model="gpt-4o", messages=messages, tools=openai_tools
 )
 print(final.choices[0].message.content)
-# "Here are the latest developments in AI: ..."
+# "Done! I searched Bing for the latest AI news and emailed a summary to alice@example.com."
 ```
 
 **What happened under the hood:**
 
 | Step | What Happens |
 |------|-------------|
-| Setup | JSON-RPC `tools/list` to MCP server → get tool schemas |
-| 2 | `POST /chat/completions` to OpenAI with `tools` (from MCP) and user message |
-| 3 | JSON-RPC `tools/call` to MCP server → execute tool remotely |
-| 5 | `POST /chat/completions` to OpenAI with full conversation |
+| Setup | JSON-RPC `tools/list` to MCP server → get both tool schemas |
+| 2 | `POST /chat/completions` to OpenAI → LLM returns `bing_search` call |
+| 3 | JSON-RPC `tools/call` to MCP server → execute search remotely |
+| 5 | `POST /chat/completions` to OpenAI → LLM returns `send_gmail_message` call |
+| 6 | JSON-RPC `tools/call` to MCP server → execute email send remotely |
+| 7 | `POST /chat/completions` to OpenAI → LLM returns text answer |
 
 ### 4. Summary of Key Differences
 
@@ -856,3 +1002,61 @@ This means LangChain tools are tightly coupled to the Python process (you must
 install the package that contains the tool), while MCP tools can live on a
 separate server and be discovered dynamically by any client that speaks the
 MCP protocol.
+
+### 6. Code Interpreter Tools
+
+The repository also contains tools for **executing Python code** in sandboxed
+environments. These are the LangChain equivalent of a "code interpreter" tool.
+
+| Tool | Class | How it works | Status |
+|------|-------|-------------|--------|
+| **E2B Data Analysis** | `E2BDataAnalysisTool` | Runs Python in a cloud sandbox via the [E2B](https://e2b.dev) API. Supports file uploads and artifact downloads. | **Active** |
+| **Bearly Interpreter** | `BearlyInterpreterTool` | Runs Python in a sandbox via the [Bearly](https://bearly.ai) API. Accepts uploaded files and returns stdout/stderr/file links. | **Active** |
+| **Python REPL** | `PythonREPLTool` | Executes code in the local Python process (no sandbox). | **Deprecated** — removed from exports |
+| **Python AST REPL** | `PythonAstREPLTool` | Same as above but parsed via AST first. | **Deprecated** — removed from exports |
+
+#### E2B Data Analysis — Example
+
+```python
+# langchain_community/tools/e2b_data_analysis/tool.py
+
+class E2BDataAnalysisTool(BaseTool):
+    name: str = "e2b_data_analysis"
+    description: str = (
+        "Evaluates python code in a sandbox environment. "
+        "The environment is long running and exists across multiple executions. "
+        "You must send the whole script every time and print your outputs."
+    )
+    # ...
+    def _run(self, python_code: str, ...) -> str:
+        # Sends code to the E2B cloud sandbox for execution
+        ...
+```
+
+#### Bearly Interpreter — Example
+
+```python
+# langchain_community/tools/bearly/tool.py
+
+class BearlyInterpreterToolArguments(BaseModel):
+    python_code: str = Field(
+        ...,
+        description=(
+            "The pure python script to be evaluated. "
+            "The contents will be in main.py. "
+            "It should not be in markdown format."
+        ),
+    )
+
+class BearlyInterpreterTool:
+    name: str = "bearly_interpreter"
+    args_schema: Type[BaseModel] = BearlyInterpreterToolArguments
+
+    def _run(self, python_code: str) -> dict:
+        # Sends code to Bearly cloud sandbox, returns stdout/stderr/file links
+        ...
+```
+
+Both tools follow the same `BaseTool` pattern as Bing Search and Gmail — they
+define `name`, `description`, `args_schema`, and `_run()`, so they can be
+bound to an LLM with `bind_tools()` in exactly the same way.
