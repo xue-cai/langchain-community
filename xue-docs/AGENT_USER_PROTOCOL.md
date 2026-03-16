@@ -2,7 +2,7 @@
 
 ## Question
 
-> Does agents built with LangChain SDK use a standard protocol between users
+> Do agents built with LangChain SDK use a standard protocol between users
 > and clients? For example, I use the SDK to build a travel agent that can
 > research travel plans, book flights and hotels, and create Google Calendar
 > events. I then host this agent to run in the cloud and expose it as a webapp
@@ -26,7 +26,7 @@ as a service.
 
 ## Options for Serving an Agent to Users
 
-### 1. LangServe (succeeded by LangGraph Platform)
+### 1. LangServe (for simpler, stateless use cases)
 
 - Wraps any LangChain `Runnable` as a REST API (FastAPI-based).
 - Provides endpoints like `/invoke`, `/stream`, `/batch`.
